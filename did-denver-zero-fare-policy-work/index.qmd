@@ -1,0 +1,436 @@
+---
+title: "Did Denver's 2022 'Zero Fare for Cleaner Air' campaign actually work?"
+author: "Ryan Peterson"
+date: "2023-07-21"
+categories: [news, code, analysis, colorado, environment, time series]
+---
+
+```{r setup, include = FALSE}
+library(tidyverse)
+library(progress)
+library(png)
+
+knitr::opts_chunk$set(echo = FALSE, warning = FALSE, message = FALSE, cache = TRUE)
+
+df_no2 <- read_csv(here::here("posts/did-denver-zero-fare-policy-work/no2_data-91-22-v3.csv"))
+df_ozone <- read_csv(here::here("posts/did-denver-zero-fare-policy-work/ozone_data-91-23.csv"))
+```
+
+A data-dictated look at whether Denver's free August public transit policy had its intended effect on air quality.
+
+![Hazy Denver](hazy-denver.jpg)
+Image credit: National Renewable Energy Laboratory, Colorado State University
+
+# Backstory
+
+Most summers, Coloradoans flock to the majestic Rocky Mountains with their beautiful hikes and various mountain activities. This is the case, at least, unless poor air quality forces them indoors. For me this occurred on a smoky July day in 2020, when my friends and I were forced indoors due to "snowing" ash sprinkling down from nearby wildfires. Between wildfires and pollution, Denver's summer air often leaves room for improvement, and sadly, the Rockies don't seem so enticing when they are obscured behind a polluted haze.
+
+In August 2022, I was surprised on my commute that the RTD bus was more crowded than usual and didn't require I scan my bus pass. I soon learned of Denver's 2022 "Zero fare for cleaner air", and became curious about how this policy experiment might turn out. Throughout the month, my commute bus was brimming with occupants. It seemed to me at the time that the policy did work to increase ridership. 
+
+According to the [final RTD report](https://www.rtd-denver.com/sites/default/files/files/2022-11/Zero-Fare%20August%20Impact%20Analysis%20Final%20Report%20-%2011.30.2022.pdf), RTD did indeed see 22% increased ridership during the free-fare month, up 36% from the August prior. This increase led some to conclude that the campaign was a huge success, and also to the expansion of the program in 2023.
+
+But wait... the campaign is called "Zero fare for better air". So for this to really be a success, the policy change should be measurable in better air quality, not just ridership. To this point, the report concluded that "impacts to air quality are difficult to quantify". They mention this difficulty is due to no baseline provided. So we're left wondering -- did it work? Did we actually have cleaner air in August of 2022?
+
+Recently, my team investigated how the Covid-19 pandemic affected congestion and air quality in cities across the US ([we found that it did](https://www.mdpi.com/2071-1050/13/13/7275)). So, today we'll use similar outcomes and methods to determine the impact of this policy in Denver.
+
+# Air Quality Data
+
+There are plenty of important pollutants to worry about in our air, but automobile traffic contributes especially to nitrous oxide (NO2) and ozone (O3). We'll consider each of these using data from the EPA's [Air Quality System](https://www.epa.gov/aqs).
+
+::: callout-note
+Code and data for this and other blog posts are available [here](https://github.com/petersonR/datadiction). 
+:::
+
+## Data visualizations
+
+Here are plots of the historical daily data for NO2.
+
+::: panel-tabset
+### Raw data
+
+```{r}
+ggplot(df_no2, aes(x=date_local, y=daily_avg)) + 
+  geom_line() + 
+  ylab("NO2") +  
+  geom_smooth() + 
+  xlab("Date")
+```
+
+### Transformed data
+
+```{r}
+ggplot(df_no2, aes(x=date_local, y=log(daily_avg+10))) + 
+  geom_line() + 
+  ylab("log(NO2+10)") +  
+  geom_smooth() + 
+  xlab("Date")
+```
+
+### 2022 only
+
+```{r}
+
+# impute minor amount of missing values
+df_no2$daily_avg_log <- log(imputeTS::na_kalman(df_no2$daily_avg) + 10)
+
+cut_date1 <- "2022-08-01"
+cut_date2 <- "2022-09-01"
+
+ggplot(df_no2, aes(x=date_local, y = daily_avg_log)) + 
+  geom_line() + 
+  geom_vline(xintercept = as.Date(cut_date1), col = "darkgrey") + 
+  geom_vline(xintercept = as.Date(cut_date2), col = "darkgrey") + 
+  ylab("Daily average NO2 in Denver") + 
+  xlab("Date") + 
+  xlim(as.Date("2022-01-01"), as.Date("2023-01-01")) +
+  annotate("text", label = "Zero fares begin", x = as.Date("2022-06-25"), y = 4.25) +
+  annotate("text", label = "Zero fares end", x = as.Date("2022-10-01"), y = 4.25)
+
+```
+
+### Monthly
+
+```{r}
+df_no2 %>% 
+  mutate(month = month(date_local, label = TRUE, abbr = TRUE)) %>% 
+  ggplot(aes(x=month, y=daily_avg)) + 
+  geom_boxplot() + 
+  ylab("Daily NO2 (1991-2023)") + 
+  xlab("")
+```
+
+### Yearly
+
+```{r}
+df_no2 %>% 
+  mutate(year = year(date_local)) %>% 
+  ggplot(aes(x=factor(year), y=daily_avg)) + 
+  geom_boxplot() + 
+  ylab("Daily NO2 (1991-2023)") + 
+  xlab("")+
+  theme(axis.text.x=element_text(angle=45, vjust = -.05))
+```
+:::
+
+## Modeling
+
+We can use this historical data to build a forecast of what August's NO2 levels would be using [forecasting methodology](https://arxiv.org/abs/2211.01492) available in the [`srlTS` R package](https://www.github.com/petersonR/srlTS) that can handle this kind of seasonal data. The series is logged (+10) prior to modeling. We include weekday and month indicator variables and a natural cubic basis spline for time. We computed 30-day-ahead predictions and tested whether these predictions were significantly different than the observed daily values during the zero-fare period. As some months were easier to forecast than others (August was easier to forecast than winter months), we also use heteroskedasticity-corrected standard errors. To evaluate our model, a 10% test set was held out.
+
+```{r modeling_no2, warning=FALSE, message=FALSE, results = "hide"}
+# General quality of srlTS model (uses train/test data)
+df_no2 <- df_no2 %>% 
+  mutate(weekday = lubridate::wday(date_local), 
+         month = lubridate::month(date_local))
+
+X <- model.matrix(~factor(weekday)+factor(month) + splines::ns(date_local, df = 10), data = df_no2)[,-1]
+
+fit_w_oos <- srlTS::srlTS(df_no2$daily_avg_log, X = X, ptrain = .9) # Fitting this for fit statistics
+# fit_w_oos # not bad fit statistics
+# s <- summary(fit_w_oos)
+
+# Now use all data to train
+fit_full <- srlTS::srlTS(df_no2$daily_avg_log, X=X, ptrain = 1, w_exo = "unpenalized")
+s <- summary(fit_full)
+s
+p30 <- predict(fit_full, n_ahead = 30)
+# cor(p30, df_no2$daily_avg_log, use = "pairwise.complete")
+
+df_no2$daily_no2_fc30 <- p30
+
+
+df_no2 <- df_no2 %>% 
+  mutate(daily_no2_rs30 = daily_avg_log - daily_no2_fc30)
+
+# ggplot(df_no2, aes(x=date_local)) + 
+#   geom_line(aes(y = daily_no2_rs30)) + 
+#   ylab("Daily average 30-day residual NO2 in Denver") + 
+#   xlab("Date")
+
+sd(df_no2$daily_no2_rs30, na.rm = T)
+sd(df_no2$daily_avg_log, na.rm = T)
+
+ggplot(df_no2, aes(x=date_local, y = daily_no2_rs30)) + 
+  geom_line() + 
+  ylab("Daily average 30-day residual NO2 in Denver") + 
+  xlab("Date")+ 
+  geom_vline(xintercept = as.Date(cut_date1), col = "darkgrey")+
+  geom_vline(xintercept = as.Date(cut_date2), col = "darkgrey")+
+  geom_hline(yintercept = 0, col = "darkgrey") +
+  xlim(as.Date("2022-01-01"), "2022-12-31")
+
+df_no2 %>% 
+  mutate(month = month(date_local), year = year(date_local)) %>% 
+  group_by(month) %>% 
+  summarize(mean_val = mean(daily_no2_rs30, na.rm=TRUE),
+            sd_val = sd(daily_no2_rs30, na.rm=TRUE))
+
+### Easier to predict in the summer months, so the other method is assuming homoskedasticity
+### And is thus much less powerful. 
+
+df_no2 <- df_no2 %>% 
+  mutate(zf = date_local >= cut_date1 & date_local <= cut_date2)
+
+t.test(df_no2$daily_no2_rs30 ~ df_no2$zf)
+
+# alternatively, use model matrix to test (assumes homoskedasticity)...
+df_no2 <- df_no2 %>% 
+  mutate(zero_fare = 1*(date_local >= cut_date1 & date_local <= cut_date2))
+
+X2 <- model.matrix(~factor(weekday)+factor(month) + splines::ns(date_local, df = 10)+zero_fare, data = df_no2)[,-1]
+
+fit_w_cutdate <- srlTS::srlTS(df_no2$daily_avg_log, X=X2, ptrain = 1, w_exo = c(rep(1, ncol(X2) -1), Inf))
+s <- summary(fit_w_cutdate)
+s
+
+# can we pull residuals from the first fit and use hetero-friendly method? 
+df_no2$r <- df_no2$daily_avg_log - predict(fit_full, n_ahead = 1) 
+my_mod <- lm(r ~ factor(month) +zero_fare, data = df_no2)
+summary(my_mod)
+lmtest::coeftest(my_mod, vcov = sandwich::vcovHC(my_mod))
+
+# can we pull residuals from the first fit and use hetero-friendly method for 30-day residuals? 
+my_mod <- lm(daily_no2_rs30 ~ factor(month) +zero_fare, data = df_no2)
+summary(my_mod)
+results <- lmtest::coeftest(my_mod, vcov = sandwich::vcovHC(my_mod))
+names(results)
+
+
+final_mr <- round(exp(results["zero_fare","Estimate"]), 3)
+final_mr_ci <- paste0(round(exp(results["zero_fare","Estimate"] + c(-1, 1) * results["zero_fare","Std. Error"]), 3), collapse = ", ")
+final_mr_p <- CIDAtools::pvalr(results["zero_fare", "Pr(>|t|)"])
+
+```
+
+Our model can predict daily NO2 on the log scale to within about 0.175 units, with an out-of-sample $R^2$ of 0.533 (about 53% of the variation in this outcome can be explained by historical patterns in our model).
+
+The observed daily NO2 values were on average a factor of `r final_mr` lower, or `r (1-final_mr)*100`% lower, during the zero-fare month compared to their forecasted values (95% CI: `r final_mr_ci`). This is strong evidence of a fairly small decrease in daily NO2 during the month of August 2022 than would have been expected historically.
+
+# Ozone
+
+## Data visualizations
+
+Here are plots of the historical daily data for ozone
+
+::: panel-tabset
+### Raw data
+
+```{r}
+df_ozone$daily_avg <- imputeTS::na_kalman(df_ozone$daily_avg)
+
+ggplot(df_ozone, aes(x=date_local, y=daily_avg)) + 
+  geom_line() + 
+  ylab("Ozone") +  
+  geom_smooth() + 
+  xlab("Date")
+```
+
+### 2022 only
+
+```{r}
+cut_date1 <- "2022-08-01"
+cut_date2 <- "2022-09-01"
+
+ggplot(df_ozone, aes(x=date_local, y = daily_avg)) + 
+  geom_line() + 
+  geom_vline(xintercept = as.Date(cut_date1)) + 
+  geom_vline(xintercept = as.Date(cut_date2)) + 
+  ylab("Daily average ozone in Denver") + 
+  xlab("Date") + 
+  xlim(as.Date("2022-01-01"), as.Date("2023-01-01")) +
+  annotate("text", label = "Zero fares begin", x = as.Date("2022-07-01"), y = .06) +
+  annotate("text", label = "Zero fares end", x = as.Date("2022-10-01"), y = 0.06)
+
+```
+
+### Monthly
+
+```{r}
+df_ozone %>% 
+  mutate(month = month(date_local, label = TRUE, abbr = TRUE)) %>% 
+  ggplot(aes(x=month, y=daily_avg)) + 
+  geom_boxplot() + 
+  ylab("Daily Ozone (1991-2023)") + 
+  xlab("")
+```
+
+### Yearly
+
+```{r}
+df_ozone %>% 
+  mutate(year = year(date_local)) %>% 
+  ggplot(aes(x=factor(year), y=daily_avg)) + 
+  geom_boxplot() + 
+  ylab("Daily Ozone (1991-2023)") + 
+  xlab("") +
+  theme(axis.text.x=element_text(angle=45, vjust = -.05))
+```
+:::
+
+## Modeling
+
+Modeling of ozone data proceeded similarly, although no outcome transformation was used.
+
+```{r modeling_ozn, warning=FALSE, message=FALSE, results = "hide"}
+# General quality of srlTS model (uses train/test data)
+df_ozone <- df_ozone %>% 
+  mutate(weekday = lubridate::wday(date_local), 
+         month = lubridate::month(date_local))
+
+X <- model.matrix(~factor(weekday)+factor(month) + splines::ns(date_local, df = 10), data = df_ozone)[,-1]
+
+fit_w_oos <- srlTS::srlTS(df_ozone$daily_avg, X = X, ptrain = .9) # Fitting this for fit statistics
+fit_w_oos # not bad fit statistics
+s <- summary(fit_w_oos)
+
+# Now use all data to train
+fit_full <- srlTS::srlTS(df_ozone$daily_avg, X=X, ptrain = 1, w_exo = "unpenalized")
+s <- summary(fit_full)
+s
+p30 <- predict(fit_full, n_ahead = 30)
+# cor(p30, df_ozone$daily_avg, use = "pairwise.complete")
+
+df_ozone$daily_ozone_fc30 <- p30
+
+
+df_ozone <- df_ozone %>% 
+  mutate(daily_ozone_rs30 = daily_avg - daily_ozone_fc30)
+
+# ggplot(df_ozone, aes(x=date_local)) + 
+#   geom_line(aes(y = daily_ozone_rs30)) + 
+#   ylab("Daily average 30-day residual ozone in Denver") + 
+#   xlab("Date")
+
+sd(df_ozone$daily_ozone_rs30, na.rm = T)
+sd(df_ozone$daily_avg, na.rm = T)
+
+ggplot(df_ozone, aes(x=date_local, y = daily_ozone_rs30)) + 
+  geom_line() + 
+  ylab("Daily average 30-day residual ozone in Denver") + 
+  xlab("Date")+ 
+  geom_vline(xintercept = as.Date(cut_date1), col = "darkgrey")+
+  geom_vline(xintercept = as.Date(cut_date2), col = "darkgrey")+
+  geom_hline(yintercept = 0, col = "darkgrey") +
+  xlim(as.Date("2022-01-01"), "2022-12-31")
+
+df_ozone %>% 
+  mutate(month = month(date_local), year = year(date_local)) %>% 
+  group_by(month) %>% 
+  summarize(mean_val = mean(daily_ozone_rs30, na.rm=TRUE),
+            sd_val = sd(daily_ozone_rs30, na.rm=TRUE))
+
+df_ozone <- df_ozone %>% 
+  mutate(zf = date_local >= cut_date1 & date_local <= cut_date2)
+
+t.test(df_ozone$daily_ozone_rs30 ~ df_ozone$zf)
+
+# alternatively, use model matrix to test (assumes homoskedasticity)...
+df_ozone <- df_ozone %>% 
+  mutate(zero_fare = 1*(date_local >= cut_date1 & date_local <= cut_date2))
+
+X2 <- model.matrix(~factor(weekday)+factor(month) + splines::ns(date_local, df = 10)+zero_fare, data = df_ozone)[,-1]
+
+fit_w_cutdate <- srlTS::srlTS(df_ozone$daily_avg, X=X2, ptrain = 1, w_exo = "unpenalized")
+s <- summary(fit_w_cutdate)
+s
+
+# can we pull residuals from the first fit and use hetero-friendly method? 
+df_ozone$r <- df_ozone$daily_avg - predict(fit_full, n_ahead = 1) 
+my_mod <- lm(r ~ factor(month) +zero_fare, data = df_ozone)
+summary(my_mod)
+lmtest::coeftest(my_mod, vcov = sandwich::vcovHC(my_mod))
+
+# can we pull residuals from the first fit and use hetero-friendly method for 30-day residuals? 
+my_mod <- lm(daily_ozone_rs30 ~ factor(month) +zero_fare, data = df_ozone)
+summary(my_mod)
+results <- lmtest::coeftest(my_mod, vcov = sandwich::vcovHC(my_mod))
+
+final_mr <- round(results["zero_fare","Estimate"], 3)
+final_mr_ci <- paste0(round(results["zero_fare","Estimate"] + c(-1, 1) * results["zero_fare","Std. Error"], 3), collapse = ", ")
+final_mr_p <- CIDAtools::pvalr(results["zero_fare", "Pr(>|t|)"])
+
+```
+
+Our model can predict daily ozone to within about 0.005 units, with an out-of-sample $R^2$ of 0.67 (about 67% of the variation in this outcome can be explained by historical patterns in our model).
+
+The observed daily ozone values were on average `r final_mr` parts per million lower during the zero-fare month compared to their forecasted values (95% CI: `r final_mr_ci`). This doesn't show evidence of a change in daily ozone during the month of August 2022 in comparison to would have been expected historically.
+
+# Takeaways
+
+-   Daily average NO2 in Denver during the zero fare month was about 4% less than forecasts (p \< 0.001)!
+-   No observable change was seen in ozone relative to forecasts.
+-   There is room for more to be done to improve Denver's air quality.
+
+# Limitations
+
+Ozone and NO2 are affected by many things on a daily basis, which were not controlled for in this analysis. A more effective analysis would control for these things, which might have improved the precision of the model estimates or better account for the possibility of confounding. Both outcomes are also not perfectly measured by the AQS stations scattered about the city of Denver; there's always the possibility that more accurate or more granular data could better show an effect of the zero-fare policy.
+
+# Sensitivity of method
+
+If the method we used for determining the effect of intervention were flawed, we might expect to see high rejection rates for any other subset of 31 days. We can check this by reproducing the same method for 31-day chunks of time surrounding August 2022. Below is a table of the estimated effect under the same methodology for every cut point listed.
+
+```{r sensitivity, cache = TRUE}
+
+cut_dates <- as.Date(
+  c(
+    "2021-01-01",
+    "2021-02-01",
+    "2021-03-01",
+    "2021-04-01",
+    "2021-05-01",
+    "2021-06-01",
+    "2021-07-01",
+    "2021-08-01",
+    "2021-09-01",
+    "2021-10-01",
+    "2021-11-01",
+    "2021-12-01",
+    "2022-01-01",
+    "2022-02-01",
+    "2022-03-01",
+    "2022-04-01",
+    "2022-05-01",
+    "2022-06-01",
+    "2022-07-01",
+    "2022-08-01",
+    "2022-09-01",
+    "2022-10-01",
+    "2022-11-01",
+    "2022-12-01"
+  )
+)
+
+sens_results_no2 <- data.frame(cut = cut_dates, estimate = 0, ci_lb = 0, ci_ub = 0, p = 0)
+
+X <- model.matrix(~factor(weekday)+factor(month) + splines::ns(date_local, df = 10), data = df_no2)[,-1]
+
+fit_full <- srlTS::srlTS(df_no2$daily_avg_log, X=X, ptrain = 1, w_exo = "unpenalized")
+p30 <- predict(fit_full, n_ahead = 30)
+df_no2$daily_no2_rs30 <- df_no2$daily_avg_log - p30
+
+for(cd in cut_dates) { 
+  df_no2 <- df_no2 %>% 
+    mutate(zf_temp = 1*(date_local >= cd & date_local <= cd+31))
+
+  my_mod <- lm(daily_no2_rs30 ~ factor(month) + zf_temp, data = df_no2)
+  results <- lmtest::coeftest(my_mod, vcov = sandwich::vcovHC(my_mod))
+  
+  ci <- exp(results["zf_temp","Estimate"] + c(-1, 1) * results["zf_temp","Std. Error"])
+  sens_results_no2[sens_results_no2$cut == cd,-1] <- 
+    c(exp(results["zf_temp","Estimate"]), ci, results["zf_temp", "Pr(>|t|)"])
+
+}
+
+sens_results_no2 %>% 
+  mutate(estimate = round(estimate, 3), ci_lb = round(ci_lb, 2), ci_ub = round(ci_ub, 2), p = round(p, 4)) %>% 
+  kableExtra::kable() %>% 
+  kableExtra::kable_minimal(full_width = FALSE) %>% 
+  kableExtra::row_spec(which(cut_dates==as.Date("2022-08-01")), bold = TRUE)
+```
+
+# On the horizon
+
+Come August 2023, Denver will roll out the program again and I will revisit this analysis to see whether zero fares produce *observably* cleaner air throughout the month. Please check out [their website](https://zerofareaugust.coloradotransit.com/) to sign up and participate.
+
+::: callout-note
+Code and data for this and other posts are available [here](https://github.com/petersonR/datadiction). 
+:::
