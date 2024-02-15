@@ -114,22 +114,22 @@ df_no2 %>%
 
 ## Modeling
 
-We can use this historical data to build a forecast of what August's NO2 levels would be using [forecasting methodology](https://arxiv.org/abs/2211.01492) available in the [`srlTS` R package](https://www.github.com/petersonR/srlTS) that can handle this kind of seasonal data. The series is logged (+10) prior to modeling. We include weekday and month indicator variables and a natural cubic basis spline for time. We computed 30-day-ahead predictions and tested whether these predictions were significantly different than the observed daily values during the zero-fare period. As some months were easier to forecast than others (August was easier to forecast than winter months), we also use heteroskedasticity-corrected standard errors. To evaluate our model, a 10% test set was held out.
+We can use this historical data to build a forecast of what August's NO2 levels would be using [forecasting methodology](https://arxiv.org/abs/2211.01492) available in the [`fastTS` R package](https://www.github.com/petersonR/fastTS) that can handle this kind of seasonal data. The series is logged (+10) prior to modeling. We include weekday and month indicator variables and a natural cubic basis spline for time. We computed 30-day-ahead predictions and tested whether these predictions were significantly different than the observed daily values during the zero-fare period. As some months were easier to forecast than others (August was easier to forecast than winter months), we also use heteroskedasticity-corrected standard errors. To evaluate our model, a 10% test set was held out.
 
 ```{r modeling_no2, warning=FALSE, message=FALSE, results = "hide"}
-# General quality of srlTS model (uses train/test data)
+# General quality of fastTS model (uses train/test data)
 df_no2 <- df_no2 %>% 
   mutate(weekday = lubridate::wday(date_local), 
          month = lubridate::month(date_local))
 
 X <- model.matrix(~factor(weekday)+factor(month) + splines::ns(date_local, df = 10), data = df_no2)[,-1]
 
-fit_w_oos <- srlTS::srlTS(df_no2$daily_avg_log, X = X, ptrain = .9) # Fitting this for fit statistics
+fit_w_oos <- fastTS::fastTS(df_no2$daily_avg_log, X = X, ptrain = .9) # Fitting this for fit statistics
 # fit_w_oos # not bad fit statistics
 # s <- summary(fit_w_oos)
 
 # Now use all data to train
-fit_full <- srlTS::srlTS(df_no2$daily_avg_log, X=X, ptrain = 1, w_exo = "unpenalized")
+fit_full <- fastTS::fastTS(df_no2$daily_avg_log, X=X, ptrain = 1, w_exo = "unpenalized")
 s <- summary(fit_full)
 s
 p30 <- predict(fit_full, n_ahead = 30)
@@ -178,7 +178,7 @@ df_no2 <- df_no2 %>%
 
 X2 <- model.matrix(~factor(weekday)+factor(month) + splines::ns(date_local, df = 10)+zero_fare, data = df_no2)[,-1]
 
-fit_w_cutdate <- srlTS::srlTS(df_no2$daily_avg_log, X=X2, ptrain = 1, w_exo = c(rep(1, ncol(X2) -1), Inf))
+fit_w_cutdate <- fastTS::fastTS(df_no2$daily_avg_log, X=X2, ptrain = 1, w_exo = c(rep(1, ncol(X2) -1), Inf))
 s <- summary(fit_w_cutdate)
 s
 
@@ -271,19 +271,19 @@ df_ozone %>%
 Modeling of ozone data proceeded similarly, although no outcome transformation was used.
 
 ```{r modeling_ozn, warning=FALSE, message=FALSE, results = "hide"}
-# General quality of srlTS model (uses train/test data)
+# General quality of fastTS model (uses train/test data)
 df_ozone <- df_ozone %>% 
   mutate(weekday = lubridate::wday(date_local), 
          month = lubridate::month(date_local))
 
 X <- model.matrix(~factor(weekday)+factor(month) + splines::ns(date_local, df = 10), data = df_ozone)[,-1]
 
-fit_w_oos <- srlTS::srlTS(df_ozone$daily_avg, X = X, ptrain = .9) # Fitting this for fit statistics
+fit_w_oos <- fastTS::fastTS(df_ozone$daily_avg, X = X, ptrain = .9) # Fitting this for fit statistics
 fit_w_oos # not bad fit statistics
 s <- summary(fit_w_oos)
 
 # Now use all data to train
-fit_full <- srlTS::srlTS(df_ozone$daily_avg, X=X, ptrain = 1, w_exo = "unpenalized")
+fit_full <- fastTS::fastTS(df_ozone$daily_avg, X=X, ptrain = 1, w_exo = "unpenalized")
 s <- summary(fit_full)
 s
 p30 <- predict(fit_full, n_ahead = 30)
@@ -329,7 +329,7 @@ df_ozone <- df_ozone %>%
 
 X2 <- model.matrix(~factor(weekday)+factor(month) + splines::ns(date_local, df = 10)+zero_fare, data = df_ozone)[,-1]
 
-fit_w_cutdate <- srlTS::srlTS(df_ozone$daily_avg, X=X2, ptrain = 1, w_exo = "unpenalized")
+fit_w_cutdate <- fastTS::fastTS(df_ozone$daily_avg, X=X2, ptrain = 1, w_exo = "unpenalized")
 s <- summary(fit_w_cutdate)
 s
 
@@ -403,7 +403,7 @@ sens_results_no2 <- data.frame(cut = cut_dates, estimate = 0, ci_lb = 0, ci_ub =
 
 X <- model.matrix(~factor(weekday)+factor(month) + splines::ns(date_local, df = 10), data = df_no2)[,-1]
 
-fit_full <- srlTS::srlTS(df_no2$daily_avg_log, X=X, ptrain = 1, w_exo = "unpenalized")
+fit_full <- fastTS::fastTS(df_no2$daily_avg_log, X=X, ptrain = 1, w_exo = "unpenalized")
 p30 <- predict(fit_full, n_ahead = 30)
 df_no2$daily_no2_rs30 <- df_no2$daily_avg_log - p30
 
